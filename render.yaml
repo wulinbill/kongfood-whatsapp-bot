@@ -1,0 +1,9 @@
+
+services:
+  - type: web
+    name: kongfood-whatsapp-bot
+    env: docker
+    plan: starter
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false

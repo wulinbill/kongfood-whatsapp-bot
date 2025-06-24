@@ -1,0 +1,10 @@
+
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+anthropic
+deepgram-sdk
+twilio
+requests
+httpx
