@@ -1,12 +1,180 @@
+# Kong Food WhatsApp AI Bot - Enhanced Requirements
+# Updated for latest versions and optimizations
+
+# Core Framework
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-python-dotenv==1.0.0
 pydantic==2.5.0
+python-multipart==0.0.6
+
+# Environment & Configuration
+python-dotenv==1.0.0
+
+# AI & Language Processing
 anthropic==0.7.8
+openai==1.3.8  # Optional for future integrations
+
+# Speech Processing
 deepgram-sdk==3.2.7
+
+# WhatsApp Integration
 twilio==8.10.3
 requests==2.31.0
+
+# HTTP Client
 httpx==0.25.2
+
+# Database (optional for future use)
+sqlalchemy==2.0.23
+alembic==1.12.1
+psycopg2-binary==2.9.8  # PostgreSQL
+redis==5.0.1  # Caching
+
+# Data Processing
+pandas==2.1.3
+numpy==1.25.2
+
+# Authentication & Security
+cryptography==41.0.7
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# File Processing
+python-magic==0.4.27
+Pillow==10.1.0  # Image processing
+pydub==0.25.1  # Audio processing
+
+# Monitoring & Logging
+structlog==23.2.0
+prometheus-client==0.19.0
+sentry-sdk[fastapi]==1.38.0
+
+# Testing
 pytest==7.4.3
 pytest-asyncio==0.21.1
-python-multipart==0.0.6
+pytest-cov==4.1.0
+pytest-mock==3.12.0
+factory-boy==3.3.0
+httpx==0.25.2  # For testing async clients
+
+# Development Tools
+black==23.11.0
+isort==5.12.0
+flake8==6.1.0
+mypy==1.7.1
+pre-commit==3.5.0
+
+# Performance
+gunicorn==21.2.0  # Production WSGI server
+gevent==23.9.1  # Async workers
+
+# Utilities
+click==8.1.7  # CLI commands
+python-dateutil==2.8.2
+pytz==2023.3
+pyyaml==6.0.1
+
+# Optional AI Enhancements
+transformers==4.36.0  # Hugging Face models
+torch==2.1.1  # PyTorch for local AI models
+sentence-transformers==2.2.2  # Semantic search
+
+# Optional Database Drivers
+pymongo==4.6.0  # MongoDB
+motor==3.3.2  # Async MongoDB
+
+# Optional Message Queue
+celery==5.3.4
+redis==5.0.1
+
+# Optional Caching
+aioredis==2.0.1
+memcached==1.59
+
+# Optional File Storage
+boto3==1.34.0  # AWS S3
+google-cloud-storage==2.10.0  # Google Cloud Storage
+
+# Development & Debugging
+rich==13.7.0  # Beautiful terminal output
+typer==0.9.0  # CLI framework
+ipython==8.17.2  # Interactive Python
+jupyter==1.0.0  # Notebooks for analysis
+
+# Security Scanning
+bandit==1.7.5
+safety==2.3.5
+
+# API Documentation
+mkdocs==1.5.3
+mkdocs-material==9.4.8
+
+# Production Deployment
+docker==6.1.3
+kubernetes==28.1.0
+
+# Monitoring
+datadog==0.49.1
+newrelic==9.3.0
+
+# Optional ML/AI Features
+scikit-learn==1.3.2
+xgboost==2.0.2
+lightgbm==4.1.0
+
+# Optional Audio Processing
+librosa==0.10.1  # Advanced audio analysis
+soundfile==0.12.1  # Audio file I/O
+
+# Optional Image Processing
+opencv-python==4.8.1.78
+imageio==2.33.0
+
+# Optional NLP
+spacy==3.7.2
+nltk==3.8.1
+textblob==0.17.1
+
+# Optional Async Database
+asyncpg==0.29.0  # Async PostgreSQL
+aiomysql==0.2.0  # Async MySQL
+
+# Optional API Rate Limiting
+slowapi==0.1.9
+limits==3.6.0
+
+# Optional Background Tasks
+rq==1.15.1  # Redis Queue
+dramatiq==1.15.0
+
+# Optional Configuration Management
+dynaconf==3.2.4
+pydantic-settings==2.1.0
+
+# Optional Timezone Handling
+babel==2.13.1
+
+# Optional Data Validation
+cerberus==1.3.5
+jsonschema==4.20.0
+
+# Optional CLI Enhancements
+colorama==0.4.6
+tabulate==0.9.0
+
+# Optional Performance Monitoring
+py-spy==0.3.14
+memory-profiler==0.61.0
+
+# Optional Code Quality
+codecov==2.1.13
+coverage==7.3.2
+
+# Version pinning for stability
+# Pin major versions for critical dependencies
+fastapi>=0.104.0,<0.105.0
+anthropic>=0.7.0,<0.8.0
+deepgram-sdk>=3.2.0,<4.0.0
+twilio>=8.10.0,<9.0.0
+httpx>=0.25.0,<0.26.0
+pydantic>=2.5.0,<3.0.0
