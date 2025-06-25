@@ -1,385 +1,712 @@
+# docker-compose.yml - 生产环境配置
 version: '3.9'
 
+x-common-variables: &common-variables
+  TZ: ${TZ:-UTC}
+  PYTHONUNBUFFERED: 1
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-resource-limits: &default-resources
+  deploy:
+    resources:
+      limits:
+        cpus: '1.0'
+        memory: 1G
+      reservations:
+        cpus: '0.25'
+        memory: 256M
+
+x-restart-policy: &restart-policy
+  restart: unless-stopped
+  deploy:
+    restart_policy:
+      condition: on-failure
+      delay: 10s
+      max_attempts: 3
+      window: 120s
+
+x-logging: &default-logging
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
-  # Main Application
-  bot:
+  # 核心应用服务
+  whatsapp-bot:
     build: 
       context: .
       dockerfile: Dockerfile
       args:
-        - PYTHON_VERSION=3.11
-    container_name: kongfood-whatsapp-bot
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.11}
+        BUILD_ENV: ${BUILD_ENV:-production}
+    image: kongfood/whatsapp-bot:${VERSION:-latest}
+    container_name: kongfood-bot
+    <<: [*restart-policy, *default-logging]
     ports:
-      - "8000:8000"
+      - "${BOT_PORT:-8000}:8000"
     env_file:
       - .env
     environment:
-      - DEBUG=false
-      - LOG_LEVEL=INFO
-      - PYTHONUNBUFFERED=1
+      <<: *common-variables
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     volumes:
-      - ./logs:/app/logs
-      - bot_data:/mnt/data
+      - app_logs:/app/logs:rw
+      - app_data:/app/data:rw
     depends_on:
-      - redis
-      - postgres
-    restart: unless-stopped
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 60s
     networks:
-      - kongfood-network
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.kongfood-bot.rule=Host(`bot.kongfood.com`)"
-      - "traefik.http.services.kongfood-bot.loadbalancer.server.port=8000"
-
-  # Redis for Caching and Session Storage
-  redis:
-    image: redis:7-alpine
-    container_name: kongfood-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-defaultpassword}
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    networks:
-      - kongfood-network
-
-  # PostgreSQL for Data Storage (Optional)
-  postgres:
-    image: postgres:15-alpine
-    container_name: kongfood-postgres
-    ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_DB=${POSTGRES_DB:-kongfood}
-      - POSTGRES_USER=${POSTGRES_USER:-kongfood}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-defaultpassword}
-      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --locale=C
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./db/init:/docker-entrypoint-initdb.d
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kongfood}"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    networks:
-      - kongfood-network
-
-  # Nginx Reverse Proxy (Optional)
-  nginx:
-    image: nginx:alpine
-    container_name: kongfood-nginx
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/ssl:/etc/nginx/ssl:ro
-      - ./logs/nginx:/var/log/nginx
-    depends_on:
-      - bot
-    restart: unless-stopped
-    networks:
-      - kongfood-network
-
-  # Monitoring with Prometheus (Optional)
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: kongfood-prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--storage.tsdb.retention.time=200h'
-      - '--web.enable-lifecycle'
-    restart: unless-stopped
-    networks:
-      - kongfood-network
-
-  # Grafana for Metrics Visualization (Optional)
-  grafana:
-    image: grafana/grafana:latest
-    container_name: kongfood-grafana
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
-      - GF_USERS_ALLOW_SIGN_UP=false
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
-      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
-    depends_on:
-      - prometheus
-    restart: unless-stopped
-    networks:
-      - kongfood-network
-
-  # Celery Worker for Background Tasks (Optional)
-  worker:
-    build: 
-      context: .
-      dockerfile: Dockerfile
-    container_name: kongfood-worker
-    command: celery -A app.worker worker --loglevel=info
-    env_file:
-      - .env
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/0
-    volumes:
-      - bot_data:/mnt/data
-    depends_on:
-      - redis
-      - postgres
-    restart: unless-stopped
-    networks:
-      - kongfood-network
-
-  # Celery Beat for Scheduled Tasks (Optional)
-  scheduler:
-    build: 
-      context: .
-      dockerfile: Dockerfile
-    container_name: kongfood-scheduler
-    command: celery -A app.worker beat --loglevel=info
-    env_file:
-      - .env
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/0
-    volumes:
-      - bot_data:/mnt/data
-    depends_on:
-      - redis
-      - postgres
-    restart: unless-stopped
-    networks:
-      - kongfood-network
-
-  # Flower for Celery Monitoring (Optional)
-  flower:
-    build: 
-      context: .
-      dockerfile: Dockerfile
-    container_name: kongfood-flower
-    command: celery -A app.worker flower --port=5555
-    ports:
-      - "5555:5555"
-    env_file:
-      - .env
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/0
-    depends_on:
-      - redis
-    restart: unless-stopped
-    networks:
-      - kongfood-network
-
-  # Log Aggregation with ELK Stack (Optional)
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
-    container_name: kongfood-elasticsearch
-    environment:
-      - discovery.type=single-node
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-      - xpack.security.enabled=false
-    ports:
-      - "9200:9200"
-    volumes:
-      - elasticsearch_data:/usr/share/elasticsearch/data
-    restart: unless-stopped
-    networks:
-      - kongfood-network
-
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.11.0
-    container_name: kongfood-kibana
-    ports:
-      - "5601:5601"
-    environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-    depends_on:
-      - elasticsearch
-    restart: unless-stopped
-    networks:
-      - kongfood-network
-
-  logstash:
-    image: docker.elastic.co/logstash/logstash:8.11.0
-    container_name: kongfood-logstash
-    volumes:
-      - ./elk/logstash/pipeline:/usr/share/logstash/pipeline:ro
-    ports:
-      - "5044:5044"
-    environment:
-      - "LS_JAVA_OPTS=-Xmx256m -Xms256m"
-    depends_on:
-      - elasticsearch
-    restart: unless-stopped
-    networks:
-      - kongfood-network
-
-# Named Volumes for Data Persistence
-volumes:
-  bot_data:
-    driver: local
-  redis_data:
-    driver: local
-  postgres_data:
-    driver: local
-  prometheus_data:
-    driver: local
-  grafana_data:
-    driver: local
-  elasticsearch_data:
-    driver: local
-
-# Networks
-networks:
-  kongfood-network:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
-
-# Development Override
-# Use: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
----
-# docker-compose.dev.yml
-version: '3.9'
-
-services:
-  bot:
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
-    environment:
-      - DEBUG=true
-      - LOG_LEVEL=DEBUG
-    volumes:
-      - .:/app
-      - /app/__pycache__
-      - /app/.pytest_cache
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    ports:
-      - "8000:8000"
-      - "8001:8001"  # Debug port
-
-  # Remove production services in development
-  nginx:
-    profiles: ["production"]
-  
-  prometheus:
-    profiles: ["monitoring"]
-    
-  grafana:
-    profiles: ["monitoring"]
-    
-  worker:
-    profiles: ["background"]
-    
-  scheduler:
-    profiles: ["background"]
-    
-  flower:
-    profiles: ["background"]
-
----
-# docker-compose.prod.yml
-version: '3.9'
-
-services:
-  bot:
-    build:
-      context: .
-      dockerfile: Dockerfile.prod
-    environment:
-      - DEBUG=false
-      - LOG_LEVEL=WARNING
+      - app-network
     deploy:
-      replicas: 2
-      restart_policy:
-        condition: on-failure
-        delay: 5s
-        max_attempts: 3
       resources:
         limits:
-          cpus: '1'
-          memory: 1G
+          cpus: '2.0'
+          memory: 2G
         reservations:
           cpus: '0.5'
           memory: 512M
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=100m
+      - /var/cache:rw,noexec,nosuid,size=50m
 
+  # Redis 缓存和会话存储
   redis:
+    image: redis:7.2-alpine
+    container_name: kongfood-redis
+    <<: [*restart-policy, *default-logging]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - redis_data:/data:rw
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - data-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=50m
+
+  # PostgreSQL 数据库
+  postgres:
+    image: postgres:15.5-alpine
+    container_name: kongfood-postgres
+    <<: [*restart-policy, *default-logging]
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      TZ: ${TZ:-UTC}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=C"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data:rw
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - ./config/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - data-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    security_opt:
+      - no-new-privileges:true
+
+  # Nginx 反向代理
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: kongfood-nginx
+    <<: [*restart-policy, *default-logging]
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - nginx_logs:/var/log/nginx:rw
+    depends_on:
+      whatsapp-bot:
+        condition: service_healthy
+    networks:
+      - app-network
+      - proxy-network
     deploy:
       resources:
         limits:
           cpus: '0.5'
           memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,size=50m
+      - /var/run:rw,noexec,nosuid,size=10m
 
-  postgres:
+  # 备份服务
+  backup:
+    image: kongfood/backup:${VERSION:-latest}
+    build:
+      context: ./backup
+      dockerfile: Dockerfile
+    container_name: kongfood-backup
+    <<: [*restart-policy, *default-logging]
+    environment:
+      <<: *common-variables
+      BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 2 * * *}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      S3_BUCKET: ${BACKUP_S3_BUCKET}
+    volumes:
+      - postgres_data:/data/postgres:ro
+      - redis_data:/data/redis:ro
+      - app_data:/data/app:ro
+      - backup_storage:/backups:rw
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - data-network
+    profiles:
+      - backup
     deploy:
       resources:
         limits:
-          cpus: '1'
+          cpus: '0.5'
           memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+
+  # 监控服务 (可选)
+  prometheus:
+    image: prom/prometheus:v2.47.2
+    container_name: kongfood-prometheus
+    <<: [*restart-policy, *default-logging]
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus:rw
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    networks:
+      - monitoring-network
+      - app-network
+    profiles:
+      - monitoring
+    <<: *default-resources
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: kongfood-grafana
+    <<: [*restart-policy, *default-logging]
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: false
+      GF_SECURITY_DISABLE_GRAVATAR: true
+      GF_ANALYTICS_REPORTING_ENABLED: false
+      GF_ANALYTICS_CHECK_FOR_UPDATES: false
+    volumes:
+      - grafana_data:/var/lib/grafana:rw
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring-network
+    profiles:
+      - monitoring
+    <<: *default-resources
+    user: "472:472"
+    security_opt:
+      - no-new-privileges:true
+
+  # 后台任务处理 (可选)
+  worker:
+    image: kongfood/whatsapp-bot:${VERSION:-latest}
+    container_name: kongfood-worker
+    <<: [*restart-policy, *default-logging]
+    command: ["celery", "-A", "app.worker", "worker", "--loglevel=info", "--concurrency=4"]
+    env_file:
+      - .env
+    environment:
+      <<: *common-variables
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+    volumes:
+      - app_data:/app/data:rw
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+      - data-network
+    profiles:
+      - workers
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    security_opt:
+      - no-new-privileges:true
+
+  scheduler:
+    image: kongfood/whatsapp-bot:${VERSION:-latest}
+    container_name: kongfood-scheduler
+    <<: [*restart-policy, *default-logging]
+    command: ["celery", "-A", "app.worker", "beat", "--loglevel=info"]
+    env_file:
+      - .env
+    environment:
+      <<: *common-variables
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+    volumes:
+      - app_data:/app/data:rw
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+      - data-network
+    profiles:
+      - workers
+    <<: *default-resources
+    security_opt:
+      - no-new-privileges:true
+
+# 持久化存储卷
+volumes:
+  postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-./data}/postgres
+  
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-./data}/redis
+  
+  app_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-./data}/app
+  
+  app_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${LOG_PATH:-./logs}/app
+  
+  nginx_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${LOG_PATH:-./logs}/nginx
+  
+  prometheus_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-./data}/prometheus
+  
+  grafana_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-./data}/grafana
+  
+  backup_storage:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${BACKUP_PATH:-./backups}
+
+# 网络隔离
+networks:
+  # 应用网络 - Bot 和 Nginx
+  app-network:
+    driver: bridge
+    internal: false
+    ipam:
+      config:
+        - subnet: 172.20.1.0/24
+    driver_opts:
+      com.docker.network.bridge.name: br-app
+
+  # 数据网络 - 数据库和缓存
+  data-network:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.20.2.0/24
+    driver_opts:
+      com.docker.network.bridge.name: br-data
+
+  # 代理网络 - 外部访问
+  proxy-network:
+    driver: bridge
+    internal: false
+    ipam:
+      config:
+        - subnet: 172.20.3.0/24
+    driver_opts:
+      com.docker.network.bridge.name: br-proxy
+
+  # 监控网络
+  monitoring-network:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.20.4.0/24
+    driver_opts:
+      com.docker.network.bridge.name: br-monitoring
 
 ---
-# docker-compose.test.yml
+# docker-compose.dev.yml - 开发环境覆盖
 version: '3.9'
 
 services:
-  test:
+  whatsapp-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    environment:
+      DEBUG: true
+      LOG_LEVEL: DEBUG
+      RELOAD: true
+    volumes:
+      - .:/app:rw
+      - /app/__pycache__
+      - /app/.pytest_cache
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    ports:
+      - "8000:8000"
+      - "5678:5678"  # 调试端口
+    read_only: false
+    security_opt: []
+
+  redis:
+    command: ["redis-server", "--requirepass", "devpassword"]
+    read_only: false
+
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: devpassword
+    ports:
+      - "5432:5432"
+
+  # 开发工具
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: redis-commander
+    environment:
+      REDIS_HOSTS: local:redis:6379:0:devpassword
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - data-network
+    profiles:
+      - dev-tools
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@kongfood.com
+      PGADMIN_DEFAULT_PASSWORD: devpassword
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - data-network
+    profiles:
+      - dev-tools
+
+  # 禁用生产服务
+  nginx:
+    profiles: ["production"]
+  backup:
+    profiles: ["production"]
+  prometheus:
+    profiles: ["production"]
+  grafana:
+    profiles: ["production"]
+
+---
+# docker-compose.test.yml - 测试环境
+version: '3.9'
+
+services:
+  test-runner:
     build:
       context: .
       dockerfile: Dockerfile.test
-    command: pytest app/tests/ -v --cov=app --cov-report=html
+    container_name: kongfood-test
+    command: ["pytest", "app/tests/", "-v", "--cov=app", "--cov-report=html", "--cov-report=term"]
     environment:
-      - TESTING=true
-      - DATABASE_URL=postgresql://test:test@test_postgres:5432/test_db
+      TESTING: true
+      DATABASE_URL: postgresql://test:test@test-postgres:5432/test_db
+      REDIS_URL: redis://test-redis:6379/0
+      LOG_LEVEL: DEBUG
     volumes:
-      - ./test-results:/app/test-results
+      - ./test-results:/app/test-results:rw
+      - ./htmlcov:/app/htmlcov:rw
     depends_on:
-      - test_postgres
-      - test_redis
+      test-postgres:
+        condition: service_healthy
+      test-redis:
+        condition: service_healthy
     networks:
       - test-network
 
-  test_postgres:
-    image: postgres:15-alpine
+  test-postgres:
+    image: postgres:15.5-alpine
+    container_name: test-postgres
     environment:
-      - POSTGRES_DB=test_db
-      - POSTGRES_USER=test
-      - POSTGRES_PASSWORD=test
+      POSTGRES_DB: test_db
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test -d test_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
       - test-network
+    tmpfs:
+      - /var/lib/postgresql/data
 
-  test_redis:
-    image: redis:7-alpine
+  test-redis:
+    image: redis:7.2-alpine
+    container_name: test-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
       - test-network
 
 networks:
   test-network:
     driver: bridge
+
+---
+# docker-compose.prod.yml - 生产环境覆盖
+version: '3.9'
+
+services:
+  whatsapp-bot:
+    deploy:
+      replicas: ${BOT_REPLICAS:-2}
+      update_config:
+        parallelism: 1
+        delay: 30s
+        failure_action: rollback
+        order: start-first
+      rollback_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+    healthcheck:
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  redis:
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  postgres:
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # 启用所有生产服务
+  nginx:
+    profiles: []
+  backup:
+    profiles: []
+  prometheus:
+    profiles: []
+  grafana:
+    profiles: []
+
+---
+# docker-compose.monitoring.yml - 监控扩展
+version: '3.9'
+
+services:
+  # 日志聚合
+  loki:
+    image: grafana/loki:2.9.2
+    container_name: kongfood-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./config/loki/loki.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki:rw
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - monitoring-network
+    profiles:
+      - logging
+
+  promtail:
+    image: grafana/promtail:2.9.2
+    container_name: kongfood-promtail
+    volumes:
+      - ./config/promtail/promtail.yml:/etc/promtail/config.yml:ro
+      - app_logs:/var/log/app:ro
+      - nginx_logs:/var/log/nginx:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    networks:
+      - monitoring-network
+    profiles:
+      - logging
+
+  # 指标收集
+  node-exporter:
+    image: prom/node-exporter:v1.6.1
+    container_name: kongfood-node-exporter
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - monitoring-network
+    profiles:
+      - monitoring
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.2
+    container_name: kongfood-cadvisor
+    ports:
+      - "8080:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    privileged: true
+    devices:
+      - /dev/kmsg
+    networks:
+      - monitoring-network
+    profiles:
+      - monitoring
+
+volumes:
+  loki_data:
+    driver: local
