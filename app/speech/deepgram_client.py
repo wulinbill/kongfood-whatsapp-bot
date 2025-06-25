@@ -1,74 +1,457 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Deepgram 语音转录客户端 (优化版)
-支持WhatsApp语音消息转录，使用最新Deepgram SDK v3
+Deepgram 语音转录客户端 (全面优化版)
+支持WhatsApp语音消息转录，减少代码重复，增强错误处理，音频质量检测
 """
 
 import os
 import asyncio
 import httpx
-from typing import Tuple, Optional, Dict, Any
+import wave
+import struct
+import audioop
+import io
+from typing import Tuple, Optional, Dict, Any, List, Union
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+import time
+import hashlib
+from collections import deque
+import threading
+
 from deepgram import (
     DeepgramClient,
     PrerecordedOptions,
     UrlSource,
+    BufferSource,
     LiveTranscriptionEvents,
     LiveOptions
 )
 from ..config import settings
 from ..logger import logger
 
-class DeepgramTranscriptionClient:
-    """Deepgram语音转录客户端 (SDK v3)"""
+class AudioQuality(Enum):
+    """音频质量等级"""
+    EXCELLENT = "excellent"
+    GOOD = "good"
+    FAIR = "fair"
+    POOR = "poor"
+    UNUSABLE = "unusable"
+
+class TranscriptionMethod(Enum):
+    """转录方法"""
+    URL_DIRECT = "url_direct"
+    FILE_UPLOAD = "file_upload"
+    LIVE_STREAM = "live_stream"
+
+@dataclass
+class AudioAnalysis:
+    """音频分析结果"""
+    duration: float = 0.0
+    sample_rate: int = 0
+    channels: int = 0
+    bit_depth: int = 0
+    file_size: int = 0
+    format_type: str = "unknown"
+    quality: AudioQuality = AudioQuality.FAIR
+    signal_to_noise_ratio: float = 0.0
+    has_speech: bool = True
+    recommended_preprocessing: List[str] = field(default_factory=list)
+
+@dataclass
+class TranscriptionResult:
+    """转录结果"""
+    text: Optional[str] = None
+    language: Optional[str] = None
+    confidence: float = 0.0
+    method_used: TranscriptionMethod = TranscriptionMethod.URL_DIRECT
+    processing_time: float = 0.0
+    audio_analysis: Optional[AudioAnalysis] = None
+    word_timestamps: List[Dict] = field(default_factory=list)
+    utterances: List[Dict] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    error_details: Optional[str] = None
+
+class AudioPreprocessor:
+    """音频预处理器"""
+    
+    @staticmethod
+    def analyze_audio_data(audio_data: bytes, mimetype: str = "audio/ogg") -> AudioAnalysis:
+        """
+        分析音频数据质量
+        
+        Args:
+            audio_data: 音频字节数据
+            mimetype: 音频类型
+            
+        Returns:
+            音频分析结果
+        """
+        analysis = AudioAnalysis()
+        analysis.file_size = len(audio_data)
+        analysis.format_type = AudioPreprocessor._detect_audio_format(audio_data)
+        
+        try:
+            # 基本检查
+            if len(audio_data) < 1024:  # 太小的文件
+                analysis.quality = AudioQuality.UNUSABLE
+                analysis.recommended_preprocessing.append("file_too_small")
+                return analysis
+            
+            # 检测格式特征
+            if analysis.format_type == "audio/wav":
+                analysis = AudioPreprocessor._analyze_wav_audio(audio_data, analysis)
+            elif analysis.format_type == "audio/ogg":
+                analysis = AudioPreprocessor._analyze_ogg_audio(audio_data, analysis)
+            else:
+                # 其他格式的基本分析
+                analysis.quality = AudioQuality.FAIR
+                analysis.has_speech = True
+            
+            # 基于文件大小和时长的质量评估
+            if analysis.duration > 0:
+                bitrate = (analysis.file_size * 8) / analysis.duration
+                
+                if bitrate > 128000:  # 高质量
+                    analysis.quality = AudioQuality.EXCELLENT
+                elif bitrate > 64000:  # 中等质量
+                    analysis.quality = AudioQuality.GOOD
+                elif bitrate > 32000:  # 可接受质量
+                    analysis.quality = AudioQuality.FAIR
+                else:  # 低质量
+                    analysis.quality = AudioQuality.POOR
+                    analysis.recommended_preprocessing.append("low_bitrate")
+            
+            # 时长检查
+            if analysis.duration < 0.5:
+                analysis.recommended_preprocessing.append("too_short")
+            elif analysis.duration > 300:  # 超过5分钟
+                analysis.recommended_preprocessing.append("segment_long_audio")
+            
+        except Exception as e:
+            logger.warning(f"Audio analysis failed: {e}")
+            analysis.quality = AudioQuality.FAIR
+        
+        return analysis
+    
+    @staticmethod
+    def _detect_audio_format(audio_data: bytes) -> str:
+        """检测音频格式"""
+        if audio_data.startswith(b'OggS'):
+            return "audio/ogg"
+        elif audio_data.startswith(b'ID3') or (len(audio_data) > 8 and audio_data[4:8] == b'ftyp'):
+            return "audio/mp4"
+        elif audio_data.startswith(b'\xff\xfb') or audio_data.startswith(b'\xff\xf3'):
+            return "audio/mpeg"
+        elif audio_data.startswith(b'RIFF') and b'WAVE' in audio_data[:20]:
+            return "audio/wav"
+        elif audio_data.startswith(b'fLaC'):
+            return "audio/flac"
+        else:
+            return "audio/ogg"  # 默认
+    
+    @staticmethod
+    def _analyze_wav_audio(audio_data: bytes, analysis: AudioAnalysis) -> AudioAnalysis:
+        """分析WAV音频"""
+        try:
+            audio_file = io.BytesIO(audio_data)
+            with wave.open(audio_file, 'rb') as wav_file:
+                analysis.sample_rate = wav_file.getframerate()
+                analysis.channels = wav_file.getnchannels()
+                analysis.bit_depth = wav_file.getsampwidth() * 8
+                analysis.duration = wav_file.getnframes() / analysis.sample_rate
+                
+                # 读取音频数据进行简单的信号分析
+                frames = wav_file.readframes(wav_file.getnframes())
+                if frames:
+                    # 计算RMS (Root Mean Square) 作为音量指标
+                    if analysis.bit_depth == 16:
+                        samples = struct.unpack(f'<{len(frames)//2}h', frames)
+                        rms = (sum(s*s for s in samples) / len(samples)) ** 0.5
+                        analysis.signal_to_noise_ratio = min(100, rms / 1000)  # 简化的SNR估算
+                    
+                    # 检查是否有语音信号
+                    max_amplitude = max(abs(s) for s in samples) if samples else 0
+                    analysis.has_speech = max_amplitude > 100  # 简单的阈值检查
+                
+        except Exception as e:
+            logger.warning(f"WAV analysis failed: {e}")
+            analysis.duration = 1.0  # 默认时长
+        
+        return analysis
+    
+    @staticmethod
+    def _analyze_ogg_audio(audio_data: bytes, analysis: AudioAnalysis) -> AudioAnalysis:
+        """分析OGG音频（简化版）"""
+        try:
+            # OGG分析比较复杂，这里做简化处理
+            # 基于文件大小估算时长
+            estimated_bitrate = 32000  # 假设32kbps（WhatsApp常用）
+            analysis.duration = (len(audio_data) * 8) / estimated_bitrate
+            analysis.sample_rate = 16000  # WhatsApp常用采样率
+            analysis.channels = 1  # 单声道
+            analysis.bit_depth = 16
+            analysis.has_speech = True
+            
+        except Exception as e:
+            logger.warning(f"OGG analysis failed: {e}")
+            analysis.duration = 1.0
+        
+        return analysis
+    
+    @staticmethod
+    def should_preprocess(analysis: AudioAnalysis) -> bool:
+        """判断是否需要预处理"""
+        return (analysis.quality in [AudioQuality.POOR, AudioQuality.UNUSABLE] or
+                len(analysis.recommended_preprocessing) > 0)
+    
+    @staticmethod
+    def apply_preprocessing(audio_data: bytes, analysis: AudioAnalysis) -> bytes:
+        """应用音频预处理"""
+        # 这里可以实现音频预处理逻辑
+        # 比如噪声减少、音量标准化等
+        # 目前返回原始数据
+        logger.info(f"Audio preprocessing recommendations: {analysis.recommended_preprocessing}")
+        return audio_data
+
+class EnhancedDeepgramClient:
+    """增强的Deepgram客户端"""
     
     def __init__(self):
         self.api_key = settings.DEEPGRAM_API_KEY
         self.client = None
+        self.preprocessor = AudioPreprocessor()
+        
+        # 性能监控
+        self.performance_stats = {
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'avg_processing_time': 0.0,
+            'quality_distribution': {quality.value: 0 for quality in AudioQuality}
+        }
+        
+        # 缓存系统
+        self.cache = {}
+        self.cache_max_size = 100
         
         if self.api_key:
             try:
                 self.client = DeepgramClient(self.api_key)
-                logger.info("Deepgram client initialized successfully")
+                logger.info("Enhanced Deepgram client initialized successfully")
             except Exception as e:
                 logger.error(f"Failed to initialize Deepgram client: {e}")
         else:
             logger.warning("Deepgram API key not found in environment")
     
-    async def transcribe_url_async(self, audio_url: str, **options) -> Tuple[Optional[str], Optional[str]]:
-        """
-        异步转录音频URL
+    def _get_cache_key(self, audio_data_or_url: Union[str, bytes], options: Dict) -> str:
+        """生成缓存键"""
+        if isinstance(audio_data_or_url, str):
+            content = audio_data_or_url
+        else:
+            content = hashlib.md5(audio_data_or_url[:1024]).hexdigest()  # 使用前1KB的hash
         
-        Args:
-            audio_url: 音频文件URL
-            **options: 转录选项
-            
-        Returns:
-            (转录文本, 检测的语言)
-        """
+        options_str = str(sorted(options.items()))
+        return hashlib.md5(f"{content}_{options_str}".encode()).hexdigest()
+    
+    def _update_performance_stats(self, success: bool, processing_time: float, 
+                                 audio_quality: AudioQuality = None):
+        """更新性能统计"""
+        self.performance_stats['total_requests'] += 1
+        
+        if success:
+            self.performance_stats['successful_requests'] += 1
+        else:
+            self.performance_stats['failed_requests'] += 1
+        
+        # 更新平均处理时间
+        total = self.performance_stats['total_requests']
+        old_avg = self.performance_stats['avg_processing_time']
+        self.performance_stats['avg_processing_time'] = (old_avg * (total - 1) + processing_time) / total
+        
+        # 更新质量分布
+        if audio_quality:
+            self.performance_stats['quality_distribution'][audio_quality.value] += 1
+    
+    def _build_transcription_options(self, **user_options) -> PrerecordedOptions:
+        """构建转录选项"""
+        default_options = {
+            "model": "nova-2",
+            "punctuate": True,
+            "detect_language": True,
+            "smart_format": True,
+            "diarize": False,
+            "filler_words": False,
+            "utterances": True,
+            "language": "multi",
+            "keywords": ["Kong Food", "pollo", "carne", "arroz", "combo"],  # 餐厅相关关键词
+            "redact": False,
+            "numerals": True
+        }
+        
+        # 合并用户选项
+        default_options.update(user_options)
+        return PrerecordedOptions(**default_options)
+    
+    def _extract_transcription_data(self, response) -> Tuple[Optional[str], Optional[str], float, List, List]:
+        """从响应中提取转录数据"""
+        if not response or not response.results:
+            return None, None, 0.0, [], []
+        
+        channels = response.results.channels
+        if not channels or len(channels) == 0:
+            return None, None, 0.0, [], []
+        
+        channel = channels[0]
+        if not channel.alternatives or len(channel.alternatives) == 0:
+            return None, None, 0.0, [], []
+        
+        alternative = channel.alternatives[0]
+        transcript = alternative.transcript.strip() if alternative.transcript else None
+        
+        # 获取置信度
+        confidence = getattr(alternative, 'confidence', 0.0)
+        
+        # 获取语言
+        detected_language = "es"  # 默认
+        if hasattr(alternative, 'language') and alternative.language:
+            lang = alternative.language.lower()
+            if lang.startswith("es"):
+                detected_language = "es"
+            elif lang.startswith("en"):
+                detected_language = "en"
+            elif lang.startswith("zh"):
+                detected_language = "zh"
+        
+        # 获取词级时间戳
+        word_timestamps = []
+        if hasattr(alternative, 'words') and alternative.words:
+            for word in alternative.words:
+                word_timestamps.append({
+                    'word': word.word,
+                    'start': word.start,
+                    'end': word.end,
+                    'confidence': getattr(word, 'confidence', 0.0)
+                })
+        
+        # 获取话语
+        utterances = []
+        if response.results.utterances:
+            for utterance in response.results.utterances:
+                utterances.append({
+                    'transcript': utterance.transcript,
+                    'start': utterance.start,
+                    'end': utterance.end,
+                    'confidence': getattr(utterance, 'confidence', 0.0),
+                    'channel': utterance.channel,
+                    'speaker': getattr(utterance, 'speaker', None)
+                })
+        
+        return transcript, detected_language, confidence, word_timestamps, utterances
+    
+    async def transcribe_url_async(self, audio_url: str, **options) -> TranscriptionResult:
+        """异步转录URL"""
+        start_time = time.time()
+        result = TranscriptionResult(method_used=TranscriptionMethod.URL_DIRECT)
+        
         if not self.client:
-            logger.error("Deepgram client not initialized")
-            return None, None
+            result.error_details = "Deepgram client not initialized"
+            return result
         
         try:
-            # 设置默认转录选项
-            default_options = {
-                "model": "nova-2",
-                "punctuate": True,
-                "detect_language": True,
-                "smart_format": True,
-                "diarize": False,
-                "filler_words": False,
-                "utterances": True,
-                "language": "multi"
-            }
+            # 检查缓存
+            cache_key = self._get_cache_key(audio_url, options)
+            if cache_key in self.cache:
+                cached_result = self.cache[cache_key]
+                cached_result.processing_time = time.time() - start_time
+                logger.info("Retrieved transcription from cache")
+                return cached_result
             
-            # 合并用户选项
-            default_options.update(options)
-            transcription_options = PrerecordedOptions(**default_options)
+            # 构建选项
+            transcription_options = self._build_transcription_options(**options)
+            audio_source = UrlSource(url=audio_url)
             
-            # 准备音频源
-            from deepgram import BufferSource
+            # 发起转录请求
+            response = await self.client.listen.asyncrest.v("1").transcribe_url(
+                source=audio_source,
+                options=transcription_options
+            )
+            
+            # 提取数据
+            text, language, confidence, word_timestamps, utterances = self._extract_transcription_data(response)
+            
+            if text:
+                result.text = text
+                result.language = language
+                result.confidence = confidence
+                result.word_timestamps = word_timestamps
+                result.utterances = utterances
+                result.processing_time = time.time() - start_time
+                
+                # 缓存结果
+                if len(self.cache) < self.cache_max_size:
+                    self.cache[cache_key] = result
+                
+                logger.info(f"URL transcription successful: '{text}' (lang: {language}, conf: {confidence:.3f})")
+                self._update_performance_stats(True, result.processing_time)
+            else:
+                result.error_details = "No transcription results found"
+                self._update_performance_stats(False, time.time() - start_time)
+            
+        except Exception as e:
+            result.error_details = str(e)
+            result.processing_time = time.time() - start_time
+            logger.error(f"Error transcribing audio URL: {e}")
+            self._update_performance_stats(False, result.processing_time)
+        
+        return result
+    
+    async def transcribe_file_async(self, audio_data: bytes, mimetype: str = "audio/ogg", **options) -> TranscriptionResult:
+        """异步转录文件"""
+        start_time = time.time()
+        result = TranscriptionResult(method_used=TranscriptionMethod.FILE_UPLOAD)
+        
+        if not self.client:
+            result.error_details = "Deepgram client not initialized"
+            return result
+        
+        try:
+            # 音频分析
+            audio_analysis = self.preprocessor.analyze_audio_data(audio_data, mimetype)
+            result.audio_analysis = audio_analysis
+            
+            # 更新质量统计
+            self.performance_stats['quality_distribution'][audio_analysis.quality.value] += 1
+            
+            # 检查是否可用
+            if audio_analysis.quality == AudioQuality.UNUSABLE:
+                result.error_details = f"Audio quality unusable: {audio_analysis.recommended_preprocessing}"
+                return result
+            
+            # 预处理（如果需要）
+            if self.preprocessor.should_preprocess(audio_analysis):
+                audio_data = self.preprocessor.apply_preprocessing(audio_data, audio_analysis)
+            
+            # 检查缓存
+            cache_key = self._get_cache_key(audio_data, options)
+            if cache_key in self.cache:
+                cached_result = self.cache[cache_key]
+                cached_result.processing_time = time.time() - start_time
+                cached_result.audio_analysis = audio_analysis
+                logger.info("Retrieved file transcription from cache")
+                return cached_result
+            
+            # 构建选项
+            transcription_options = self._build_transcription_options(**options)
+            
+            # 根据分析结果调整选项
+            if audio_analysis.quality == AudioQuality.POOR:
+                # 对低质量音频使用增强模型
+                transcription_options.model = "enhanced"
+                transcription_options.filler_words = True  # 低质量音频可能需要填充词过滤
+            
             audio_source = BufferSource(buffer=audio_data, mimetype=mimetype)
             
             # 发起转录请求
@@ -77,153 +460,110 @@ class DeepgramTranscriptionClient:
                 options=transcription_options
             )
             
-            # 解析响应（与URL方法相同）
-            if response and response.results:
-                channels = response.results.channels
-                
-                if channels and len(channels) > 0:
-                    channel = channels[0]
-                    
-                    if channel.alternatives and len(channel.alternatives) > 0:
-                        alternative = channel.alternatives[0]
-                        transcript = alternative.transcript.strip()
-                        
-                        detected_language = "es"
-                        
-                        if hasattr(alternative, 'language') and alternative.language:
-                            lang = alternative.language
-                            if lang.startswith("es"):
-                                detected_language = "es"
-                            elif lang.startswith("en"):
-                                detected_language = "en"
-                            elif lang.startswith("zh"):
-                                detected_language = "zh"
-                        
-                        logger.info(f"File transcription successful: '{transcript}' (language: {detected_language})")
-                        return transcript, detected_language
+            # 提取数据
+            text, language, confidence, word_timestamps, utterances = self._extract_transcription_data(response)
             
-            logger.warning("No transcription results found in file")
-            return None, None
+            if text:
+                result.text = text
+                result.language = language
+                result.confidence = confidence
+                result.word_timestamps = word_timestamps
+                result.utterances = utterances
+                result.processing_time = time.time() - start_time
+                result.metadata = {
+                    'audio_duration': audio_analysis.duration,
+                    'audio_quality': audio_analysis.quality.value,
+                    'preprocessing_applied': len(audio_analysis.recommended_preprocessing) > 0
+                }
+                
+                # 缓存结果
+                if len(self.cache) < self.cache_max_size:
+                    self.cache[cache_key] = result
+                
+                logger.info(f"File transcription successful: '{text}' (lang: {language}, conf: {confidence:.3f}, quality: {audio_analysis.quality.value})")
+                self._update_performance_stats(True, result.processing_time, audio_analysis.quality)
+            else:
+                result.error_details = "No transcription results found"
+                self._update_performance_stats(False, time.time() - start_time, audio_analysis.quality)
             
         except Exception as e:
+            result.error_details = str(e)
+            result.processing_time = time.time() - start_time
             logger.error(f"Error transcribing audio file: {e}")
-            return None, None
+            self._update_performance_stats(False, result.processing_time)
+        
+        return result
     
-    def transcribe_url_sync(self, audio_url: str, **options) -> Tuple[Optional[str], Optional[str]]:
-        """同步转录URL接口"""
+    def transcribe_sync(self, audio_data_or_url: Union[str, bytes], 
+                       mimetype: str = "audio/ogg", **options) -> TranscriptionResult:
+        """统一的同步转录接口"""
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # 在新线程中运行
-                import concurrent.futures
-                import threading
-                
-                def run_async():
-                    new_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(new_loop)
-                    try:
-                        return new_loop.run_until_complete(
-                            self.transcribe_url_async(audio_url, **options)
-                        )
-                    finally:
-                        new_loop.close()
-                
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(run_async)
-                    return future.result(timeout=30)
-            else:
-                return loop.run_until_complete(self.transcribe_url_async(audio_url, **options))
+            # 获取或创建事件循环
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # 在运行的循环中，使用线程池
+                    return self._run_in_thread(audio_data_or_url, mimetype, **options)
+                else:
+                    # 循环未运行，直接运行
+                    if isinstance(audio_data_or_url, str):
+                        return loop.run_until_complete(self.transcribe_url_async(audio_data_or_url, **options))
+                    else:
+                        return loop.run_until_complete(self.transcribe_file_async(audio_data_or_url, mimetype, **options))
+            except RuntimeError:
+                # 没有事件循环，创建新的
+                if isinstance(audio_data_or_url, str):
+                    return asyncio.run(self.transcribe_url_async(audio_data_or_url, **options))
+                else:
+                    return asyncio.run(self.transcribe_file_async(audio_data_or_url, mimetype, **options))
+        
         except Exception as e:
             logger.error(f"Error in sync transcription: {e}")
-            return None, None
+            result = TranscriptionResult()
+            result.error_details = str(e)
+            return result
     
-    def transcribe_file_sync(self, audio_data: bytes, mimetype: str = "audio/ogg", **options) -> Tuple[Optional[str], Optional[str]]:
-        """同步转录文件接口"""
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                
-                def run_async():
-                    new_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(new_loop)
-                    try:
-                        return new_loop.run_until_complete(
-                            self.transcribe_file_async(audio_data, mimetype, **options)
-                        )
-                    finally:
-                        new_loop.close()
-                
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(run_async)
-                    return future.result(timeout=30)
-            else:
-                return loop.run_until_complete(self.transcribe_file_async(audio_data, mimetype, **options))
-        except Exception as e:
-            logger.error(f"Error in sync file transcription: {e}")
-            return None, None
+    def _run_in_thread(self, audio_data_or_url: Union[str, bytes], 
+                      mimetype: str = "audio/ogg", **options) -> TranscriptionResult:
+        """在单独线程中运行异步函数"""
+        import concurrent.futures
+        
+        def run_async():
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                if isinstance(audio_data_or_url, str):
+                    return new_loop.run_until_complete(
+                        self.transcribe_url_async(audio_data_or_url, **options)
+                    )
+                else:
+                    return new_loop.run_until_complete(
+                        self.transcribe_file_async(audio_data_or_url, mimetype, **options)
+                    )
+            finally:
+                new_loop.close()
+        
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(run_async)
+            return future.result(timeout=40)  # 40秒超时
     
-    async def setup_live_transcription(self, on_message_callback, **options) -> Optional[Any]:
-        """
-        设置实时转录
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """获取性能统计"""
+        stats = self.performance_stats.copy()
+        if stats['total_requests'] > 0:
+            stats['success_rate'] = stats['successful_requests'] / stats['total_requests']
+            stats['failure_rate'] = stats['failed_requests'] / stats['total_requests']
+        else:
+            stats['success_rate'] = 0.0
+            stats['failure_rate'] = 0.0
         
-        Args:
-            on_message_callback: 消息回调函数
-            **options: 转录选项
-            
-        Returns:
-            WebSocket连接对象
-        """
-        if not self.client:
-            logger.error("Deepgram client not initialized")
-            return None
-        
-        try:
-            # 设置实时转录选项
-            default_options = {
-                "model": "nova-2",
-                "punctuate": True,
-                "smart_format": True,
-                "interim_results": True,
-                "utterance_end_ms": "1000",
-                "vad_events": True,
-                "language": "multi"
-            }
-            
-            default_options.update(options)
-            live_options = LiveOptions(**default_options)
-            
-            # 创建WebSocket连接
-            dg_connection = self.client.listen.asyncwebsocket.v("1")
-            
-            # 设置事件处理器
-            @dg_connection.on(LiveTranscriptionEvents.Open)
-            async def on_open(self, open, **kwargs):
-                logger.info("Deepgram live connection opened")
-            
-            @dg_connection.on(LiveTranscriptionEvents.Transcript)
-            async def on_message(self, result, **kwargs):
-                if result.is_final:
-                    transcript = result.channel.alternatives[0].transcript
-                    if transcript:
-                        await on_message_callback(transcript)
-            
-            @dg_connection.on(LiveTranscriptionEvents.Close)
-            async def on_close(self, close, **kwargs):
-                logger.info("Deepgram live connection closed")
-            
-            @dg_connection.on(LiveTranscriptionEvents.Error)
-            async def on_error(self, error, **kwargs):
-                logger.error(f"Deepgram live connection error: {error}")
-            
-            # 启动连接
-            await dg_connection.start(live_options)
-            
-            return dg_connection
-            
-        except Exception as e:
-            logger.error(f"Error setting up live transcription: {e}")
-            return None
+        stats['cache_size'] = len(self.cache)
+        return stats
+    
+    def clear_cache(self):
+        """清空缓存"""
+        self.cache.clear()
+        logger.info("Transcription cache cleared")
     
     def get_supported_languages(self) -> List[str]:
         """获取支持的语言列表"""
@@ -247,397 +587,137 @@ class DeepgramTranscriptionClient:
             "pl", "pl-PL",
             "tr", "tr-TR"
         ]
-    
-    def get_model_info(self) -> Dict[str, Any]:
-        """获取模型信息"""
-        return {
-            "nova-2": {
-                "description": "Latest general-purpose model with 30% lower error rates",
-                "languages": self.get_supported_languages(),
-                "features": ["punctuation", "formatting", "diarization", "utterances"]
-            },
-            "nova": {
-                "description": "Previous generation general-purpose model",
-                "languages": self.get_supported_languages(),
-                "features": ["punctuation", "formatting", "diarization"]
-            },
-            "enhanced": {
-                "description": "Enhanced model for phone call audio",
-                "languages": ["en", "es"],
-                "features": ["punctuation", "phone_call_optimization"]
-            },
-            "base": {
-                "description": "Fastest model with basic features",
-                "languages": ["en"],
-                "features": ["basic_transcription"]
-            }
-        }
 
-class WhatsAppAudioProcessor:
-    """WhatsApp音频处理器 (优化版)"""
+class OptimizedWhatsAppProcessor:
+    """优化的WhatsApp音频处理器"""
     
     def __init__(self):
-        self.deepgram_client = DeepgramTranscriptionClient()
+        self.deepgram_client = EnhancedDeepgramClient()
         self.supported_formats = ["audio/ogg", "audio/mpeg", "audio/mp4", "audio/wav"]
-    
-    async def download_whatsapp_audio(self, media_url: str, auth_headers: Dict[str, str] = None) -> Optional[bytes]:
-        """
-        下载WhatsApp音频文件
         
-        Args:
-            media_url: 音频文件URL
-            auth_headers: 认证头 (Twilio需要)
-            
-        Returns:
-            音频文件字节数据
-        """
-        try:
-            headers = auth_headers or {}
-            
-            async with httpx.AsyncClient() as client:
-                response = await client.get(media_url, headers=headers, timeout=30)
+        # 重试配置
+        self.retry_config = {
+            'max_retries': 3,
+            'retry_delay': 1.0,
+            'backoff_factor': 2.0
+        }
+    
+    async def download_whatsapp_audio(self, media_url: str, 
+                                    auth_headers: Dict[str, str] = None) -> Optional[bytes]:
+        """优化的WhatsApp音频下载"""
+        headers = auth_headers or {}
+        
+        for attempt in range(self.retry_config['max_retries']):
+            try:
+                timeout_config = httpx.Timeout(30.0, connect=10.0)
                 
-                if response.status_code == 200:
-                    content_type = response.headers.get('content-type', 'audio/ogg')
-                    logger.info(f"Audio downloaded: {len(response.content)} bytes, type: {content_type}")
-                    return response.content
-                else:
-                    logger.error(f"Failed to download audio: HTTP {response.status_code}")
-                    return None
+                async with httpx.AsyncClient(timeout=timeout_config) as client:
+                    response = await client.get(media_url, headers=headers)
                     
-        except Exception as e:
-            logger.error(f"Error downloading WhatsApp audio: {e}")
-            return None
-    
-    async def process_whatsapp_audio(self, media_url: str, auth_headers: Dict[str, str] = None) -> Tuple[Optional[str], Optional[str]]:
-        """
-        处理WhatsApp音频消息
+                    if response.status_code == 200:
+                        content_type = response.headers.get('content-type', 'audio/ogg')
+                        content_length = len(response.content)
+                        
+                        logger.info(f"Audio downloaded: {content_length} bytes, type: {content_type}")
+                        
+                        # 基本验证
+                        if content_length < 100:  # 太小的文件
+                            logger.warning("Downloaded audio file is too small")
+                            return None
+                        
+                        return response.content
+                    else:
+                        logger.warning(f"Download attempt {attempt + 1} failed: HTTP {response.status_code}")
+                        
+            except httpx.TimeoutException:
+                logger.warning(f"Download attempt {attempt + 1} timed out")
+            except Exception as e:
+                logger.warning(f"Download attempt {attempt + 1} error: {e}")
+            
+            # 重试延迟
+            if attempt < self.retry_config['max_retries'] - 1:
+                delay = self.retry_config['retry_delay'] * (self.retry_config['backoff_factor'] ** attempt)
+                await asyncio.sleep(delay)
         
-        Args:
-            media_url: 音频文件URL
-            auth_headers: 认证头
-            
-        Returns:
-            (转录文本, 语言)
-        """
-        try:
-            # 方式1：直接使用URL（推荐，速度更快）
-            text, language = await self.deepgram_client.transcribe_url_async(media_url)
-            
-            if text:
-                logger.info(f"Direct URL transcription successful: '{text}' ({language})")
-                return text, language
-            
-            # 方式2：下载后处理（备用方案）
-            logger.info("Direct URL transcription failed, trying download method")
-            audio_data = await self.download_whatsapp_audio(media_url, auth_headers)
-            
-            if audio_data:
-                # 检测音频格式
-                mimetype = self._detect_audio_format(audio_data)
-                text, language = await self.deepgram_client.transcribe_file_async(audio_data, mimetype)
-                
-                if text:
-                    logger.info(f"Downloaded file transcription successful: '{text}' ({language})")
-                    return text, language
-            
-            logger.warning("Both transcription methods failed")
-            return None, None
-            
-        except Exception as e:
-            logger.error(f"Error processing WhatsApp audio: {e}")
-            return None, None
+        logger.error("All download attempts failed")
+        return None
     
-    def _detect_audio_format(self, audio_data: bytes) -> str:
-        """
-        检测音频格式
+    async def process_whatsapp_audio(self, media_url: str, 
+                                   auth_headers: Dict[str, str] = None) -> TranscriptionResult:
+        """统一的WhatsApp音频处理"""
         
-        Args:
-            audio_data: 音频文件字节数据
+        # 方法1：直接URL转录（推荐）
+        logger.info("Attempting direct URL transcription")
+        result = await self.deepgram_client.transcribe_url_async(
+            media_url, 
+            model="nova-2",
+            smart_format=True
+        )
+        
+        if result.text and result.confidence > 0.3:
+            logger.info(f"Direct URL transcription successful: confidence={result.confidence:.3f}")
+            return result
+        
+        # 方法2：下载后转录（备用）
+        logger.info("Direct URL failed, trying download method")
+        audio_data = await self.download_whatsapp_audio(media_url, auth_headers)
+        
+        if audio_data:
+            # 检测格式
+            detected_format = AudioPreprocessor._detect_audio_format(audio_data)
             
-        Returns:
-            MIME类型
-        """
-        # 检查文件头来确定格式
-        if audio_data.startswith(b'OggS'):
-            return "audio/ogg"
-        elif audio_data.startswith(b'ID3') or audio_data[4:8] == b'ftyp':
-            return "audio/mp4"
-        elif audio_data.startswith(b'\xff\xfb') or audio_data.startswith(b'\xff\xf3'):
-            return "audio/mpeg"
-        elif audio_data.startswith(b'RIFF') and b'WAVE' in audio_data[:20]:
-            return "audio/wav"
+            # 转录文件
+            file_result = await self.deepgram_client.transcribe_file_async(
+                audio_data, 
+                detected_format,
+                model="nova-2",
+                smart_format=True
+            )
+            
+            if file_result.text:
+                logger.info(f"File transcription successful: confidence={file_result.confidence:.3f}")
+                return file_result
+        
+        # 如果都失败了，返回最好的结果
+        if result.text:
+            return result
+        elif 'file_result' in locals() and file_result.text:
+            return file_result
         else:
-            # 默认为OGG (WhatsApp常用格式)
-            return "audio/ogg"
+            # 创建失败结果
+            failed_result = TranscriptionResult()
+            failed_result.error_details = "All transcription methods failed"
+            return failed_result
     
-    def process_whatsapp_audio_sync(self, media_url: str, auth_headers: Dict[str, str] = None) -> Tuple[Optional[str], Optional[str]]:
-        """同步处理WhatsApp音频"""
+    def process_whatsapp_audio_sync(self, media_url: str, 
+                                  auth_headers: Dict[str, str] = None) -> TranscriptionResult:
+        """同步WhatsApp音频处理"""
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                import concurrent.futures
-                
-                def run_async():
-                    new_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(new_loop)
-                    try:
-                        return new_loop.run_until_complete(
-                            self.process_whatsapp_audio(media_url, auth_headers)
-                        )
-                    finally:
-                        new_loop.close()
-                
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(run_async)
-                    return future.result(timeout=35)
+                return self._run_whatsapp_in_thread(media_url, auth_headers)
             else:
                 return loop.run_until_complete(self.process_whatsapp_audio(media_url, auth_headers))
+        except RuntimeError:
+            return asyncio.run(self.process_whatsapp_audio(media_url, auth_headers))
         except Exception as e:
-            logger.error(f"Error in sync WhatsApp audio processing: {e}")
-            return None, None
-
-# 全局实例
-_global_processor = WhatsAppAudioProcessor()
-_global_client = DeepgramTranscriptionClient()
-
-def transcribe(audio_url: str, **options) -> Tuple[Optional[str], Optional[str]]:
-    """
-    外部调用接口 - 同步转录URL
+            logger.error(f"Error in sync WhatsApp processing: {e}")
+            result = TranscriptionResult()
+            result.error_details = str(e)
+            return result
     
-    Args:
-        audio_url: 音频URL
-        **options: 转录选项
+    def _run_whatsapp_in_thread(self, media_url: str, auth_headers: Dict[str, str] = None) -> TranscriptionResult:
+        """在单独线程中运行WhatsApp处理"""
+        import concurrent.futures
         
-    Returns:
-        (转录文本, 语言)
-    """
-    return _global_client.transcribe_url_sync(audio_url, **options)
-
-def transcribe_file(audio_data: bytes, mimetype: str = "audio/ogg", **options) -> Tuple[Optional[str], Optional[str]]:
-    """
-    外部调用接口 - 同步转录文件
-    
-    Args:
-        audio_data: 音频数据
-        mimetype: 文件类型
-        **options: 转录选项
+        def run_async():
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                return new_loop.run_until_complete(
+                    self.process_whatsapp_audio(media_url, auth_headers)
+                )
+            finally:
+                new_loop.close()
         
-    Returns:
-        (转录文本, 语言)
-    """
-    return _global_client.transcribe_file_sync(audio_data, mimetype, **options)
-
-async def transcribe_async(audio_url: str, **options) -> Tuple[Optional[str], Optional[str]]:
-    """
-    外部调用接口 - 异步转录URL
-    
-    Args:
-        audio_url: 音频URL
-        **options: 转录选项
-        
-    Returns:
-        (转录文本, 语言)
-    """
-    return await _global_client.transcribe_url_async(audio_url, **options)
-
-async def transcribe_file_async(audio_data: bytes, mimetype: str = "audio/ogg", **options) -> Tuple[Optional[str], Optional[str]]:
-    """
-    外部调用接口 - 异步转录文件
-    
-    Args:
-        audio_data: 音频数据
-        mimetype: 文件类型
-        **options: 转录选项
-        
-    Returns:
-        (转录文本, 语言)
-    """
-    return await _global_client.transcribe_file_async(audio_data, mimetype, **options)
-
-def transcribe_whatsapp(media_url: str, auth_headers: Dict[str, str] = None) -> Tuple[Optional[str], Optional[str]]:
-    """
-    WhatsApp语音消息转录 - 同步接口
-    
-    Args:
-        media_url: WhatsApp媒体URL
-        auth_headers: 认证头
-        
-    Returns:
-        (转录文本, 语言)
-    """
-    return _global_processor.process_whatsapp_audio_sync(media_url, auth_headers)
-
-async def transcribe_whatsapp_async(media_url: str, auth_headers: Dict[str, str] = None) -> Tuple[Optional[str], Optional[str]]:
-    """
-    WhatsApp语音消息转录 - 异步接口
-    
-    Args:
-        media_url: WhatsApp媒体URL
-        auth_headers: 认证头
-        
-    Returns:
-        (转录文本, 语言)
-    """
-    return await _global_processor.process_whatsapp_audio(media_url, auth_headers)
-
-def test_deepgram_connection() -> bool:
-    """测试Deepgram连接"""
-    try:
-        # 使用公开的测试音频文件
-        test_url = "https://static.deepgram.com/examples/Bueller-Life-moves-pretty-fast.wav"
-        text, language = transcribe(test_url)
-        success = text is not None and len(text) > 0
-        
-        if success:
-            logger.info(f"Deepgram connection test successful: '{text}' ({language})")
-        else:
-            logger.error("Deepgram connection test failed: no transcription result")
-            
-        return success
-    except Exception as e:
-        logger.error(f"Deepgram connection test failed: {e}")
-        return False
-
-def get_supported_languages() -> List[str]:
-    """获取支持的语言列表"""
-    return _global_client.get_supported_languages()
-
-def get_model_info() -> Dict[str, Any]:
-    """获取模型信息"""
-    return _global_client.get_model_info()
-
-# 向后兼容
-def get_client():
-    """获取客户端实例"""
-    return _global_client
-
-def get_processor():
-    """获取处理器实例"""
-    return _global_processor
-
-
-# 测试函数
-if __name__ == "__main__":
-    import asyncio
-    
-    async def test_deepgram():
-        """测试Deepgram客户端"""
-        print("Testing Enhanced Deepgram API Client...")
-        
-        # 测试连接
-        connection_ok = test_deepgram_connection()
-        print(f"Connection test: {'Passed' if connection_ok else 'Failed'}")
-        
-        # 测试支持的语言
-        languages = get_supported_languages()
-        print(f"Supported languages: {len(languages)} languages")
-        
-        # 测试模型信息
-        models = get_model_info()
-        print(f"Available models: {list(models.keys())}")
-        
-        # 测试公开音频URL
-        test_url = "https://static.deepgram.com/examples/Bueller-Life-moves-pretty-fast.wav"
-        
-        # 异步测试
-        text, language = await transcribe_async(test_url, model="nova-2")
-        print(f"Async transcription: '{text}' (language: {language})")
-        
-        # 同步测试
-        sync_text, sync_language = transcribe(test_url, model="nova-2")
-        print(f"Sync transcription: '{sync_text}' (language: {sync_language})")
-        
-        # 测试不同模型
-        enhanced_text, enhanced_lang = await transcribe_async(test_url, model="enhanced")
-        print(f"Enhanced model: '{enhanced_text}' (language: {enhanced_lang})")
-    
-    asyncio.run(test_deepgram()),
-                "filler_words": False,
-                "utterances": True,
-                "language": "multi"  # 多语言检测
-            }
-            
-            # 合并用户选项
-            default_options.update(options)
-            transcription_options = PrerecordedOptions(**default_options)
-            
-            # 准备音频源
-            audio_source = UrlSource(url=audio_url)
-            
-            # 发起转录请求
-            response = await self.client.listen.asyncrest.v("1").transcribe_url(
-                source=audio_source,
-                options=transcription_options
-            )
-            
-            # 解析响应
-            if response and response.results:
-                channels = response.results.channels
-                
-                if channels and len(channels) > 0:
-                    channel = channels[0]
-                    
-                    if channel.alternatives and len(channel.alternatives) > 0:
-                        alternative = channel.alternatives[0]
-                        transcript = alternative.transcript.strip()
-                        
-                        # 获取检测的语言
-                        detected_language = "es"  # 默认西班牙语
-                        
-                        # 从语言检测结果获取
-                        if hasattr(alternative, 'language') and alternative.language:
-                            lang = alternative.language
-                            if lang.startswith("es"):
-                                detected_language = "es"
-                            elif lang.startswith("en"):
-                                detected_language = "en"
-                            elif lang.startswith("zh"):
-                                detected_language = "zh"
-                        
-                        # 从utterances获取语言信息（如果可用）
-                        if response.results.utterances and len(response.results.utterances) > 0:
-                            utterance = response.results.utterances[0]
-                            if hasattr(utterance, 'language') and utterance.language:
-                                detected_lang = utterance.language
-                                if detected_lang.startswith("es"):
-                                    detected_language = "es"
-                                elif detected_lang.startswith("en"):
-                                    detected_language = "en"
-                                elif detected_lang.startswith("zh"):
-                                    detected_language = "zh"
-                        
-                        logger.info(f"Transcription successful: '{transcript}' (language: {detected_language})")
-                        return transcript, detected_language
-            
-            logger.warning("No transcription results found")
-            return None, None
-            
-        except Exception as e:
-            logger.error(f"Error transcribing audio URL: {e}")
-            return None, None
-    
-    async def transcribe_file_async(self, audio_data: bytes, mimetype: str = "audio/ogg", **options) -> Tuple[Optional[str], Optional[str]]:
-        """
-        异步转录音频文件数据
-        
-        Args:
-            audio_data: 音频文件字节数据
-            mimetype: 音频文件类型
-            **options: 转录选项
-            
-        Returns:
-            (转录文本, 检测的语言)
-        """
-        if not self.client:
-            logger.error("Deepgram client not initialized")
-            return None, None
-        
-        try:
-            # 设置默认转录选项
-            default_options = {
-                "model": "nova-2",
-                "punctuate": True,
-                "detect_language": True,
-                "smart_format": True,
-                "diarize": False
+        with concurrent.futures.Threa
